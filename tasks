@@ -710,7 +710,7 @@ parent_uuid = '%s'" % (id, task.uuid))
 		target = os.path.expanduser('~/.taskdb.d/%s' % name)
 
 		os.unlink(default)
-		os.symlink(default, target)
+		os.symlink(target, default)
 		TaskList(target)				# force creation of new DB
 	
 	def cmd_update_tree(self):
