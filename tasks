@@ -1,0 +1,684 @@
+#!/usr/bin/env python
+# coding: utf8
+if __name__ == '__main__':
+	import sys
+	sys.stdout.write('Loading...')
+
+import datetime, dateutil.parser, getpass, os, paramiko, random, sqlite3
+import shutil, sys
+from dateutil.relativedelta import *
+from uuid import uuid4
+from StringIO import StringIO
+
+PRIORITIES = [
+	'Critical',
+	'High',
+	'Normal',
+	'Low',
+	'Wish'
+]
+
+PRIORITY_CLR = {
+	'Critical': '~B~r',
+	'High':     '~B~g',
+	'Normal':   '~y',
+	'Low':      '',
+	'Wish':     '~z'
+}
+
+def pick(a, b):
+	return b if a is None else a
+
+class Task(object):
+	def __init__(self, task_list, record_id = None, uuid = None, title = None,
+			parent_uuid = None, progress = None, priority = None, due = None,
+			notes = None):
+		self.task_list = task_list
+		self.record_id = record_id
+		self.uuid = uuid or str(uuid4())
+
+		self.title = title
+		self.parent_uuid = parent_uuid
+		self.progress = progress
+		self.priority = priority
+		self.due = dateutil.parser.parse(due) if isinstance(due, unicode) else due
+		self.entered = datetime.datetime.now()
+		self.notes = notes
+	
+	@property
+	def parent(self):
+		return self.task_list.find_uuid(self.parent_uuid)
+
+	@property
+	def children(self):
+		return self.task_list.children(self.uuid)
+
+	@property
+	def depth(self):
+		depth = 0
+		current = self
+
+		while current.parent_uuid is not None:
+			current = current.parent
+			depth += 1
+
+		return depth
+
+	def save(self):
+		if self.record_id is None:
+			self.task_list.add(self)
+		else:
+			self.task_list.update(self)
+			
+	def remove(self):
+		self.task_list.remove(self.record_id, self.uuid)
+
+	
+	def format(self, field):
+		if hasattr(self, field) and getattr(self, field) is None:
+			return '-'
+		elif field == 'progress':
+			return '%d%%' % self.progress
+		elif field == 'priority':
+			return PRIORITIES[self.priority]
+		elif field == 'due':
+			return self.due.strftime('%d/%m/%y')
+		elif field == 'entered':
+			return self.entered.strftime('%d/%m/%y')
+		elif field == 'id':
+			return str(self.record_id)
+		elif field == 'n?':
+			return 'N' if self.notes is None else 'Y'
+		elif field == 'notes':
+			return unicode(self.notes)
+		else:
+			return str(getattr(self, field))
+	
+	def to_list(self):
+		return [self.uuid, self.title, self.parent_uuid, self.progress,
+				self.priority, self.due, self.notes]
+
+class TaskList(object):
+	def __init__(self, filename, initialise = False):
+		if not os.path.exists(filename):
+			initialise = True
+
+		self.conn = sqlite3.connect(filename)
+
+		if initialise:
+			# We need to create the tables
+			cursor = self.conn.cursor()
+			cursor.execute('''CREATE TABLE tasks (
+	id INTEGER PRIMARY KEY,
+	uuid VARCHAR,
+	title VARCHAR NOT NULL,
+	parent_uuid INTEGER,
+	progress INTEGER,
+	priority INTEGER,
+	due DATE,
+	notes VARCHAR
+)''')
+			cursor.execute('''CREATE TABLE remotes (
+	name VARCHAR,
+	host VARCHAR,
+	port INTEGER,
+	user VARCHAR,
+	key VARCHAR,
+	last_sync DATETIME
+)''')
+			cursor.execute('CREATE TABLE deleted (uuid VARCHAR)')
+			cursor.close()
+
+	
+	def find(self, record_id):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT uuid, title, parent_uuid, progress, priority, due,\
+notes FROM tasks WHERE id = ?', [record_id])
+		row = cursor.fetchone()
+		cursor.close()
+
+		if row is None:
+			return None
+		else:
+			task = Task(self, record_id, *row)
+			return task
+
+	def find_uuid(self, uuid):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT id, uuid, title, parent_uuid, progress, priority, due,\
+notes FROM tasks WHERE uuid = ?', [uuid])
+		row = cursor.fetchone()
+		cursor.close()
+
+		if row is None:
+			return None
+		else:
+			task = Task(self, *row)
+			return task
+	
+	def add(self, task):
+		cursor = self.conn.cursor()
+		cursor.execute('INSERT INTO tasks (uuid, title, parent_uuid, progress,\
+priority, due, notes) VALUES (?, ?, ?, ?, ?, ?, ?)', task.to_list())
+		task.record_id = cursor.lastrowid
+		cursor.close()
+		self.conn.commit()
+	
+	def update(self, task):
+		cursor = self.conn.cursor()
+		values = task.to_list() + [task.record_id]
+		cursor.execute('UPDATE tasks SET uuid = ?, title = ?, parent_uuid = ?,\
+progress = ?, priority = ?, due = ?, notes = ? WHERE id = ?', values)
+		cursor.close()
+		self.conn.commit()
+
+	def update_uuid(self, task):
+		cursor = self.conn.cursor()
+		values = task.to_list()[1:] + [task.uuid]
+		cursor.execute('UPDATE tasks SET title = ?, parent_uuid = ?,\
+progress = ?, priority = ?, due = ?, notes = ? WHERE uuid = ?', values)
+		cursor.close()
+		self.conn.commit()
+
+	def children(self, uuid):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT id, uuid, title, parent_uuid, progress,\
+priority, due, notes FROM tasks WHERE parent_uuid = ?', [uuid])
+		tasks = [Task(self, *row) for row in cursor.fetchall()]
+		cursor.close()
+
+		return tasks
+	
+	def list(self, query = '', params = []):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT id, uuid, title, parent_uuid, progress, priority,\
+due, notes FROM tasks ' + query, params)
+		tasks = [Task(self, *row) for row in cursor.fetchall()]
+		cursor.close()
+
+		return tasks
+	
+	def remove(self, task_id, uuid):
+		cursor = self.conn.cursor()
+		cursor.execute('DELETE FROM tasks WHERE id = ?', [task_id])
+		cursor.execute('INSERT INTO deleted (uuid) VALUES (?)', [uuid])
+		cursor.close()
+		self.conn.commit()
+	
+	def remotes(self):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT name FROM remotes')
+		names = [row[0] for row in cursor.fetchall()]
+		cursor.close()
+
+		return names
+
+	def remote(self, name):
+		'Return (host, port, user, key, last_sync) for a given remote.'
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT host, port, user, key, last_sync FROM remotes \
+WHERE name = ?', [name])
+		row = cursor.fetchone()
+		cursor.close()
+		
+		return row
+
+	def add_remote(self, name, host, port = 22, user = None, key = None):
+		cursor = self.conn.cursor()
+		cursor.execute('INSERT INTO remotes (name, host, port, user, key) \
+VALUES (?, ?, ?, ?, ?)', [name, host, port, user, key])
+		cursor.close()
+		self.conn.commit()
+	
+	def remote_synced(self, name, when):
+		cursor = self.conn.cursor()
+		cursor.execute('UPDATE remotes SET last_sync = ? WHERE name = ?',
+					   [when, name])
+		cursor.close()
+		self.conn.commit()
+	
+	def deleted(self):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT * FROM deleted')
+		uuids = [row[0] for row in cursor.fetchall()]
+		cursor.close()
+
+		return uuids
+
+
+class TasksApp(object):
+	def __init__(self, task_list):
+		self.task_list = task_list
+		self.fields = ['id', 'title', 'progress', 'priority', 'due',
+					   'entered']
+	
+	def run(self, argv = None):
+		argv = sys.argv if argv is None else argv
+		command = argv[1] if len(argv) > 1 else 'list'
+		funct = 'cmd_' + command.replace('-', '_')
+
+		def parse(arg):
+			try:
+				return int(arg)
+			except ValueError:
+				try:
+					return float(arg)
+				except ValueError:
+					return arg
+
+		if hasattr(self, funct):
+			pos = []
+			kw = {}
+
+			for arg in argv[2:]:
+				if '=' in arg:
+					parts = arg.split('=')
+					key = parts[0]
+					value = '='.join(parts[1:])
+					kw[key] = parse(value)
+				else:
+					pos.append(parse(arg))
+
+			getattr(self, funct)(*pos, **kw)
+		else:
+			self.write('~rerror~0: unrecognised command "%s".\n' % command)
+			sys.exit(1)
+
+
+	def write(self, out):
+		for k, v in ({'~B': '\x1B[1m', '~0': '\x1B[0m', '~r': '\x1B[31m',
+					  '~g': '\x1B[32m', '~y': '\x1B[33m',
+					  '~b': '\x1B[34m', '~z': '\x1B[30m'}).items():
+			out = out.replace(k, v)
+
+		sys.stdout.write(out.encode('utf8'))
+	
+	def table(self, sort, descending, number = -1, cond = '1', fields = None):
+		fields = fields or (self.fields + ['n?'])
+		direction = 'DESC' if descending else 'ASC'
+		limit = '' if number == -1 else 'LIMIT %d' % number
+		query = 'WHERE parent_uuid IS NULL AND %s ORDER BY %s %s %s' % (cond,
+			sort.lower(), direction, limit)
+		tasks = self.task_list.list(query)
+		
+		if len(tasks) == 0:
+			self.write('There are no tasks to display.\n')
+		else:
+			lengths = {'title': 6, 'progress': 9, 'priority': 9, 'due': 4,
+					   'entered': 8, 'id': 6, 'n?': 3}
+			width = os.environ.get('COLUMNS', 80)
+			maxima =  {'title': width - 40, 'progress': 4, 'priority': 8,
+					   'due': 12, 'entered': 12, 'id': 6, 'n?': 3}
+
+			# Find the longest for this field
+			def find_longest(tasks, lengths, depth = 0):
+				for field in fields:
+					for task in tasks:
+						length = len(task.format(field)) + 1
+
+						if field == 'id' and depth > 0:
+							length += depth * 2 + 1
+						elif field == 'title':
+							length += depth
+						
+						if length > lengths.get(field, 0) and\
+								length <= maxima[field]:
+							lengths[field] = length
+
+						find_longest(task.children, lengths, depth + 1)
+
+			find_longest(tasks, lengths)
+
+			self.write('~B')
+			for field in fields:
+				spaces = lengths[field] - len(field)
+				self.write(field.title() + ' ' * spaces)
+			self.write('~0\n')
+
+			def do_tasks(tasks, level = 0):
+				for task in tasks:
+					for field in fields:
+						value = task.format(field)
+
+						if field == 'id':
+							value = (u'↳ ' * level) + value
+						elif field == 'title':
+							value = (' ' * level) + value
+
+						if len(value) > lengths[field]:
+							value = value[:lengths[field] - 4] + '... '
+						else:
+							value += ' ' * (lengths[field] - len(value))
+
+						if task.progress == 100:
+							value = '~z%s~0' % value
+						elif field == 'n?' and value.startswith('Y'):
+							value = '~B~gY~0'
+						elif field == 'priority':
+							priority = PRIORITIES[pick(task.priority, 3)]
+							value = PRIORITY_CLR[priority] + value + '~0'
+						elif field == 'progress':
+							progress = pick(task.progress, 79)
+							if progress < 20:
+								colour = '~r'
+							elif progress < 50:
+								colour = '~y'
+							elif progress < 80:
+								colour = ''
+							else:
+								colour = '~g'
+
+							value = colour + value + '~0'
+
+						self.write(value)
+
+					self.write('\n')
+					do_tasks(task.children, level + 1)
+
+			do_tasks(tasks)
+
+	
+	def cmd_list(self, sort = 'id', direction = 'asc', number = -1):
+		self.table(sort, direction == 'desc', number)
+	
+	def cmd_late(self, sort = 'id', direction = 'desc', number = -1):
+		self.table(sort, direction, number, "due < DATETIME('now')")
+	
+	def get_task(self, id = None, uuid = None, title = None,
+				 parent = None, progress = None, priority = None,
+				 due = None, notes = None):
+		if priority is not None:
+			priority = PRIORITIES.index(priority)
+
+		if due is not None:
+			today = datetime.datetime.now()
+			weekdays = {'monday': MO, 'tuesday': TU, 'wednesday': WE,
+					    'thursday': TH, 'friday': FR}
+
+			if due == 'today':
+				due = today
+			elif due == 'tomorrow':
+				due = today + relativedelta(days = +1)
+			elif due in weekdays:
+				due = today + relativedelta(weekday = weekdays[due])
+			elif due.startswith('next-') and due[5:] in weekdays:
+				due = today + relativedelta(weekday = weekdays[due](2))
+			else:
+				due = dateutil.parser.parse(due, dayfirst = True)
+
+		if parent is not None:
+			# convert from numeric ID -> UUID
+			parent = self.task_list.find(parent).uuid
+
+		if id is None:
+			t = Task(self.task_list, None, None, title, parent, progress,
+					 priority, due, notes)
+		else:
+			t = self.task_list.find(id)
+			d = {'parent': 'parent_uuid'}
+			
+			for f in ['uuid', 'title', 'parent', 'progress', 'priority',
+					  'due', 'notes']:
+				local = locals()[f]
+
+				if local is not None:
+					setattr(t, d.get(f, f), local)
+
+		return t
+
+	def cmd_add(self, title, *a, **kw):
+		self.get_task(None, None, title, *a, **kw).save()
+	
+	def cmd_set(self, id, *a, **kw):
+		self.get_task(id, None, *a, **kw).save()
+	
+	def cmd_priorities(self):
+		[self.write('%s\n' % x) for x in PRIORITIES]
+	
+	def cmd_remotes(self):
+		[self.write('%s\n' % x) for x in self.task_list.remotes()]
+	
+	def cmd_add_remote(self, name, host, port = 22, user = None,
+					   keyfile = None):
+		if keyfile is None:
+			key = None
+		else:
+			handle = open(keyfile)
+			key = handle.read()
+			handle.close()
+
+		self.task_list.add_remote(name, host, port, user, key)
+	
+	def cmd_del(self, id):
+		self.task_list.find(id).remove()
+	
+	def cmd_pull(self, remote):
+		host, port, user, key, last_sync = self.task_list.remote(remote)
+		MergeTool.pull(host, port, user, key)
+		self.task_list.remote_synced(remote, datetime.datetime.now())
+		self.task_list.remote_synced(remote, datetime.datetime.now())
+
+	def cmd_push(self, remote):
+		host, port, user, key, last_sync = self.task_list.remote(remote)
+		MergeTool.push(host, port, user, key)
+		self.task_list.remote_synced(remote, datetime.datetime.now())
+	
+	def cmd_show_remote(self, remote):
+		host, port, user, key, last_sync = self.task_list.remote(remote)
+
+		if last_sync is None:
+			last_sync = 'never'
+		else:
+			fmt = '%m/%d/%y %H:%M:%S'
+			last_sync = dateutil.parser.parse(last_sync).strftime(fmt)
+
+		user = getpass.getuser() if user is None else user
+
+		self.write('~BURI:~0         %s@%s:%d\n' % (user, host, port))
+		self.write('~BKey Stored?:~0 %s\n' % ('no' if key is None else 'yes'))
+		self.write('~BLast Synced:~0 %s\n' % last_sync)
+	
+	def cmd_view(self, id):
+		fields = self.fields + ['notes']
+		max_length = max(map(len, fields))
+		task = self.task_list.find(id)
+
+		for field in fields:
+			spaces = ' ' * (max_length - len(field) + 1)
+			value = task.format(field)
+
+			if '\n' in value:
+				value = value.replace('\n', '\n' + (' ' * (max_length + 2)))
+
+			self.write('~B%s:%s~0%s\n' % (field.title(), spaces, value))
+
+		# this will print subtasks as well
+		self.write('\n')
+		self.table('id', True, cond = ('id = %d' % id))
+	
+	def cmd_notes(self, id):
+		task = self.task_list.find(id)
+		notes_file = '/tmp/notes.%d' % random.randrange(1, 2 ** 16)
+		editor = os.environ.get('EDITOR', 'vi')
+
+		handle = open(notes_file, 'w')
+		handle.write(task.format('notes').encode('utf8'))
+		handle.close()
+
+		os.system('%s "%s"' % (editor, notes_file))
+
+		handle = open(notes_file, 'r')
+		task.notes = handle.read().decode('utf8')
+		handle.close()
+
+		task.save()
+		os.unlink(notes_file)
+	
+	def cmd_uuid(self, id):
+		self.write('%s\n' % self.task_list.find(id).uuid)
+	
+	def cmd_uuidgen(self):
+		for t in self.task_list.list():
+			t.save()
+	
+	def cmd_deleted(self):
+		[self.write('%s\n' % x) for x in self.task_list.deleted()]
+	
+	def cmd_help(self):
+		print('''Usage: %s COMMAND
+
+COMMAND is one of:
+	add          (title, [parent, progress, priority, due, notes])
+		Add a new task.
+	add-remote   (name, host, [port, user, keyfile])
+		Add a remote host for synchronisation.
+	del          (id)
+		Delete a task.
+	deleted
+		[debug] View the list of deleted tasks.
+	help
+		Show this help message.
+	late         (sort, direction, number)
+		Print a listing of late tasks.
+	list         (sort, direction, number)
+		List number (default all) tasks, sorted by the given
+		field (asc or desc).
+	notes        (id)
+		Edit the notes field for the given task using $EDITOR.
+	priorities
+		List the possible values for the priority field.
+	pull         (remote)
+		Download a remote tasklist and merge it with the local list.
+	push         (remote)
+		Merge the local tasklist with a remote list and upload it.
+	remotes
+		List the names of available synchronisation destinations.
+	show-remote  (remote)
+		Show the details associated with a remote destination.
+	set          (id, [title, parent, progress, priority, due, notes])
+		Set the value of a particular field on a task.
+	uuid         (id)
+		[debug] Show the UUID for a given task.
+	uuidgen
+		[debug] Force the generation of UUIDs for all tasks.
+	view         (id)
+		View a task in detail, including notes.
+''' % sys.argv[0])
+
+
+class MergeTool(object):
+	'Merges one task database into another.'
+	def __init__(self, dest, src):
+		self.dest = TaskList(dest)
+		self.dest_fn = dest
+		self.src = TaskList(src)
+		self.src_fn = src
+	
+	def merge(self):
+		self.updates()
+		self.deletes()
+	
+	def updates(self):
+		# we need to go through all the entries in src and add or amend the
+		# tasks in dest
+		for src_task in self.src.list():
+			dest_task = self.dest.find_uuid(src_task.uuid)
+
+			if dest_task is None:
+				self.dest.add(src_task)
+			else:
+				self.dest.update_uuid(src_task)
+	
+	def deletes(self):
+		# now delete any matches we find in the deleted table
+		for src_task in self.src.deleted():
+			dest_task = self.dest.find_uuid(src_task)
+
+			if dest_task is not None:
+				dest_task.remove()
+	
+
+	@classmethod
+	def connect(cls, host, port = 22, user = None, key = None):
+		if user is None:
+			user = getpass.getuser()
+
+		print('Connecting to %s:%d...' % (host, port))
+		transport = paramiko.Transport((host, port))
+		transport.start_client()
+
+		def auth_handler(title, inst, prompts):
+			resp = []
+
+			print('\x1B[1m%s\x1B[0m' % title)
+			print(inst)
+
+			for prompt, echo in prompts:
+				if echo:
+					resp.append(raw_input(prompt))
+				else:
+					resp.append(getpass.getpass(prompt))
+		
+		if key is None:
+			print('Authenticating interactively...')
+			transport.auth_interactive(user, auth_handler)
+		else:
+			print('Authenticating using stored keyfile...')
+			keybuf = StringIO(key)
+			pkey = paramiko.RSAKey.from_private_key(keybuf)
+			transport.auth_publickey(user, pkey)
+
+		sftp = paramiko.SFTPClient.from_transport(transport)
+		return transport, sftp
+
+	@classmethod
+	def retrieve_db(cls, host, port = 22, user = None, key = None):
+		transport, sftp = cls.connect(host, port, user, key)
+		target = '/tmp/taskpull.%d' % random.randrange(1, 2 ** 16)
+
+		print('Downloading remote tasklist...')
+		# we should be in the user's home directory
+		sftp.get('.taskdb', target)
+
+		# deliberately not closing transport
+		return transport, sftp, target
+
+
+	@classmethod
+	def pull(cls, host, port = 22, user = None, key = None):
+		# retrieve remote tasklist
+		transport, sftp, target = cls.retrieve_db(host, port, user, key)
+		transport.close()
+
+		print('Merging...')
+		source = os.path.expanduser('~/.taskdb')
+		merger = cls(source, target)
+		merger.merge()
+
+		print('Done.')
+		os.unlink(target)
+	
+	@classmethod
+	def push(cls, host, port = 22, user = None, key = None):
+		# get remote tasklist
+		transport, sftp, target = cls.retrieve_db(host, port, user, key)
+		source = os.path.expanduser('~/.taskdb')
+
+		print('Merging...')
+		merger = cls(target, source)
+		merger.merge()
+
+		print('Uploading tasklist...')
+		sftp.put(target, '.taskdb')
+		transport.close()
+
+		print('Done.')
+		os.unlink(target)
+
+
+if __name__ == '__main__':
+	task_list = TaskList(os.path.expanduser('~/.taskdb'))
+	sys.stdout.write('\r          \r')
+	TasksApp(task_list).run()
+
+	
