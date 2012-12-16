@@ -942,7 +942,10 @@ if __name__ == '__main__':
 			sys.argv.remove(i)
 			break
 
-	task_list = TaskList(TaskList.active_path())
+	if 'update-tree' in sys.argv:
+		task_list = TaskList('/tmp/%d' % random.randrange(1, 2 ** 16))
+	else:
+		task_list = TaskList(TaskList.active_path())
 	TasksApp(task_list).run()
 
 	
