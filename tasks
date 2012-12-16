@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 # coding: utf8
-from __future__ import print_function
-
-import datetime, dateutil.parser, getpass, os, paramiko, random, sqlite3
+import datetime, dateutil.parser, getpass, os, random, sqlite3
 import shutil, sys, time
 from dateutil.relativedelta import *
 from uuid import uuid4
@@ -137,7 +135,7 @@ class Task(object):
 		elif field == 'n?':
 			return 'N' if self.notes is None else '~B~gY~0'
 		elif field == 'priority':
-			priority = PRIORITIES[pick(self.priority, 3)]
+			priority = PRIORITIES[pick(self.priority, 0)]
 			return PRIORITY_CLR[priority] + self.format_str(field) + '~0'
 		elif field == 'progress':
 			progress = pick(self.progress, 79)
@@ -557,8 +555,9 @@ class TasksApp(object):
 	def cmd_add(self, title, *a, **kw):
 		self.get_task(None, None, title, *a, **kw).save()
 	
-	def cmd_set(self, id, *a, **kw):
-		self.get_task(id, None, *a, **kw).save()
+	def cmd_set(self, ids, *a, **kw):
+		for id in str(ids).split(','):
+			self.get_task(int(id), None, *a, **kw).save()
 	
 	def cmd_priorities(self):
 		[self.write('%s\n' % x) for x in PRIORITIES]
@@ -656,12 +655,19 @@ parent_uuid = '%s'" % (id, task.uuid))
 	def cmd_regen(self):
 		MergeTool.regen()
 	
-	def cmd_motd(self):
+	def cmd_motd(self, style = 'default', reset = '~0'):
 		tasks = len(self.task_list.list())
 		late = len(self.task_list.list("WHERE due < date('now')"))
 		today = len(self.task_list.list("WHERE date(due) = date('now')"))
-		self.write('You have ~B%d~0 tasks, ~B%d~0 for today and \
+
+		if style == 'default':
+			self.write('You have ~B%d~0 tasks, ~B%d~0 for today and \
 ~B~r%d~0 late.\n' % (tasks, today, late))
+		elif style == 'compress':
+			self.write('~B%d%s ~B%d%s ~B~r%d%s' % (tasks, reset, today, reset,
+					   late, reset))
+		elif style == 'raw':
+			self.write('%d\n%d\n%d\n' % (tasks, today, late))
 	
 	def cmd_calendar(self, upto = None):
 		if upto is not None:
@@ -721,6 +727,19 @@ parent_uuid = '%s'" % (id, task.uuid))
 		shutil.move(source, os.path.join(target, 'default'))
 		os.symlink(os.path.join(target, 'default'), source)
 	
+	def cmd_show_lists(self):
+		path = os.path.expanduser('~/.taskdb.d')
+		[self.write('%s\n' % x) for x in os.listdir(path)]
+	
+	def cmd_del_list(self, name):
+		del_path = os.path.realpath(os.path.expanduser('~/.taskdb.d/%s' % name))
+
+		if os.path.realpath(TaskList.active_path()) == del_path:
+			self.cmd_switch('default')
+
+		os.unlink(del_path)
+
+	
 	def cmd_help(self):
 		print('''Usage: %s COMMAND
 
@@ -733,6 +752,8 @@ COMMAND is one of:
 		View your tasks in calendar form by due date, up to a given day.
 	del          (id)
 		Delete a task.
+	del-list     (name)
+		Delete a task list.
 	deleted
 		[debug] View the list of deleted tasks.
 	help
@@ -756,10 +777,12 @@ COMMAND is one of:
 		Regenerate a clean task database.
 	remotes
 		List the names of available synchronisation destinations.
+	show-lists
+		List the available task databases.
 	show-remote  (remote)
 		Show the details associated with a remote destination.
-	set          (id, [title, parent, progress, priority, due, notes])
-		Set the value of a particular field on a task.
+	set          (ids, [title, parent, progress, priority, due, notes])
+		Set the value of a field on tasks with an ID in ids (comma-separated).
 	switch       (name)
 		Switch to a (possibly new) task list called name.
 	tag          (id, tag, [...])
@@ -784,6 +807,8 @@ COMMAND is one of:
 class MergeTool(object):
 	'Merges one task database into another.'
 	def __init__(self, dest, src):
+		# so we don't bog down loading when we don't need SSH
+		import paramiko
 		self.dest = TaskList(dest)
 		self.dest_fn = dest
 		self.src = TaskList(src)
@@ -870,7 +895,10 @@ class MergeTool(object):
 
 		print('Downloading remote tasklist...')
 		# we should be in the user's home directory
-		sftp.get('.taskdb' if name is None else '.taskdb.d/%s' % name, target)
+		try:
+			sftp.get('.taskdb' if name is None else '.taskdb.d/%s' % name, target)
+		except IOError:
+			return transport, sftp, None
 
 		# deliberately not closing transport
 		return transport, sftp, target
@@ -882,32 +910,40 @@ class MergeTool(object):
 		transport, sftp, target = cls.retrieve_db(host, port, user, key, name)
 		transport.close()
 
-		print('Merging...')
-		source = os.path.expanduser('~/.taskdb')
-		merger = cls(source, target)
-		stats = merger.merge()
+		if target is None:
+			print('\x1B[31merror\x1B[0m: no such database %s' % name)
+		else:
+			print('Merging...')
+			source = os.path.expanduser('~/.taskdb')
+			merger = cls(source, target)
+			stats = merger.merge()
 
-		print('%d additions, %d amendments, %d deletions.' % stats)
-		print('Done.')
-		os.unlink(target)
+			print('%d additions, %d amendments, %d deletions.' % stats)
+			print('Done.')
+			os.unlink(target)
 	
 	@classmethod
 	def push(cls, host, port = 22, user = None, key = None, name = 'default'):
 		# get remote tasklist
-		transport, sftp, target = cls.retrieve_db(host, port, user, key)
-		source = os.path.expanduser('~/.taskdb')
+		transport, sftp, target = cls.retrieve_db(host, port, user, key, name)
+		source = TaskList.active_path()
 
-		print('Merging...')
-		merger = cls(target, source)
-		stats = merger.merge()
+		if target is None:
+			print('Note: target database does not exist on remote server.')
+		else:
+			print('Merging...')
+			merger = cls(target, source)
+			stats = merger.merge()
+			print('%d additions, %d amendments, %d deletions.' % stats)
 
 		print('Uploading tasklist...')
-		sftp.put(target, '.taskdb.d/%s' % name)
+		sftp.put(target or source, '.taskdb.d/%s' % name)
 		transport.close()
 
-		print('%d additions, %d amendments, %d deletions.' % stats)
 		print('Done.')
-		os.unlink(target)
+
+		if target is not None:
+			os.unlink(target)
 	
 	@classmethod
 	def regen(cls):
