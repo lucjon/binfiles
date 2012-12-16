@@ -580,15 +580,14 @@ class TasksApp(object):
 	def cmd_del(self, id):
 		self.task_list.find(id).remove()
 	
-	def cmd_pull(self, remote):
+	def cmd_pull(self, remote, name = 'default'):
 		host, port, user, key, last_sync = self.task_list.remote(remote)
-		MergeTool.pull(host, port, user, key)
-		self.task_list.remote_synced(remote, datetime.datetime.now())
+		MergeTool.pull(host, port, user, key, name)
 		self.task_list.remote_synced(remote, datetime.datetime.now())
 
-	def cmd_push(self, remote):
+	def cmd_push(self, remote, name = 'default'):
 		host, port, user, key, last_sync = self.task_list.remote(remote)
-		MergeTool.push(host, port, user, key)
+		MergeTool.push(host, port, user, key, name)
 		self.task_list.remote_synced(remote, datetime.datetime.now())
 	
 	def cmd_show_remote(self, remote):
@@ -749,9 +748,9 @@ COMMAND is one of:
 		Edit the notes field for the given task using $EDITOR.
 	priorities
 		List the possible values for the priority field.
-	pull         (remote)
+	pull         (remote, [name])
 		Download a remote tasklist and merge it with the local list.
-	push         (remote)
+	push         (remote, [name])
 		Merge the local tasklist with a remote list and upload it.
 	regen
 		Regenerate a clean task database.
