@@ -1,21 +1,19 @@
 #!/usr/bin/env python
 # coding: utf8
-if __name__ == '__main__':
-	import sys
-	sys.stdout.write('Loading...')
+from __future__ import print_function
 
 import datetime, dateutil.parser, getpass, os, paramiko, random, sqlite3
-import shutil, sys
+import shutil, sys, time
 from dateutil.relativedelta import *
 from uuid import uuid4
 from StringIO import StringIO
 
 PRIORITIES = [
-	'Critical',
-	'High',
-	'Normal',
 	'Low',
-	'Wish'
+	'Wish',
+	'Normal',
+	'High',
+	'Critical',
 ]
 
 PRIORITY_CLR = {
@@ -29,6 +27,22 @@ PRIORITY_CLR = {
 def pick(a, b):
 	return b if a is None else a
 
+def parse_date(datestr):
+	today = datetime.datetime.now()
+	weekdays = {'monday': MO, 'tuesday': TU, 'wednesday': WE,
+				'thursday': TH, 'friday': FR}
+
+	if datestr == 'today':
+		return today
+	elif datestr == 'tomorrow':
+		return today + relativedelta(days = +1)
+	elif datestr in weekdays:
+		return today + relativedelta(weekday = weekdays[datestr])
+	elif datestr.startswith('next-') and datestr[5:] in weekdays:
+		return today + relativedelta(weekday = weekdays[datestr[5:]](2))
+	else:
+		return dateutil.parser.parse(datestr, dayfirst = True)
+
 class Task(object):
 	def __init__(self, task_list, record_id = None, uuid = None, title = None,
 			parent_uuid = None, progress = None, priority = None, due = None,
@@ -36,6 +50,7 @@ class Task(object):
 		self.task_list = task_list
 		self.record_id = record_id
 		self.uuid = uuid or str(uuid4())
+		self._depth = None
 
 		self.title = title
 		self.parent_uuid = parent_uuid
@@ -54,15 +69,23 @@ class Task(object):
 		return self.task_list.children(self.uuid)
 
 	@property
+	def tags(self):
+		return self.task_list.tags(self.uuid)
+
+	@property
 	def depth(self):
-		depth = 0
-		current = self
+		if self._depth == None:
+			depth = 0
+			current = self
 
-		while current.parent_uuid is not None:
-			current = current.parent
-			depth += 1
+			while current.parent_uuid is not None:
+				current = current.parent
+				depth += 1
 
-		return depth
+			self._depth = depth
+			return depth
+		else:
+			return self._depth
 
 	def save(self):
 		if self.record_id is None:
@@ -72,9 +95,15 @@ class Task(object):
 			
 	def remove(self):
 		self.task_list.remove(self.record_id, self.uuid)
+	
+	def tag(self, tag):
+		self.task_list.tag(self.uuid, tag)
+
+	def untag(self, tag):
+		self.task_list.tag(self.uuid, tag)
 
 	
-	def format(self, field):
+	def format_str(self, field):
 		if hasattr(self, field) and getattr(self, field) is None:
 			return '-'
 		elif field == 'progress':
@@ -86,13 +115,44 @@ class Task(object):
 		elif field == 'entered':
 			return self.entered.strftime('%d/%m/%y')
 		elif field == 'id':
-			return str(self.record_id)
+			if self.depth > 0:
+				spaces = ('  ' * max(0, self.depth - 1))
+				return spaces + u'↳ ' + str(self.record_id)
+			else:
+				return str(self.record_id)
+		elif field == 'title':
+			return (' ' * self.depth) + self.title
 		elif field == 'n?':
 			return 'N' if self.notes is None else 'Y'
 		elif field == 'notes':
 			return unicode(self.notes)
+		elif field == 'tags':
+			return ', '.join(self.tags)
 		else:
 			return str(getattr(self, field))
+	
+	def format(self, field):
+		if self.progress == 100:
+			return '~z%s~0' % self.format_str(field)
+		elif field == 'n?':
+			return 'N' if self.notes is None else '~B~gY~0'
+		elif field == 'priority':
+			priority = PRIORITIES[pick(self.priority, 3)]
+			return PRIORITY_CLR[priority] + self.format_str(field) + '~0'
+		elif field == 'progress':
+			progress = pick(self.progress, 79)
+			if progress < 20:
+				colour = '~r'
+			elif progress < 50:
+				colour = '~y'
+			elif progress < 80:
+				colour = ''
+			else:
+				colour = '~g'
+
+			return colour + self.format_str(field) + '~0'
+		else:
+			return self.format_str(field)
 	
 	def to_list(self):
 		return [self.uuid, self.title, self.parent_uuid, self.progress,
@@ -126,8 +186,24 @@ class TaskList(object):
 	key VARCHAR,
 	last_sync DATETIME
 )''')
+			cursor.execute('''CREATE TABLE tags (
+	tag VARCHAR,
+	task_uuid VARCHAR
+)''')
 			cursor.execute('CREATE TABLE deleted (uuid VARCHAR)')
 			cursor.close()
+	
+	name_override = None
+
+	@classmethod
+	def active_path(cls):
+		'Return the path to the active database.'
+		if cls.name_override is not None:
+			name = cls.name_override
+		else:
+			name = os.environ.get('TASKLIST', '../.taskdb')
+
+		return os.path.expanduser('~/.taskdb.d/%s' % name)
 
 	
 	def find(self, record_id):
@@ -244,6 +320,135 @@ VALUES (?, ?, ?, ?, ?)', [name, host, port, user, key])
 		cursor.close()
 
 		return uuids
+	
+	def tags(self, uuid):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT tag, task_uuid FROM tags')
+		tags = [row[0] for row in cursor.fetchall()]
+		cursor.close()
+
+		return tags
+
+	def tag(self, uuid, name):
+		if name in self.tags(uuid):
+			return False
+
+		cursor = self.conn.cursor()
+		cursor.execute('INSERT INTO tags (tag, task_uuid) VALUES (?, ?)',
+					   [name, uuid])
+		cursor.close()
+		self.conn.commit()
+		return True
+
+	def untag(self, uuid, name):
+		cursor = self.conn.cursor()
+		cursor.execute('DELETE FROM tags WHERE tag = ? AND task_uuid = ?',
+					   [name, uuid])
+		cursor.close()
+		self.conn.commit()
+	
+	def tagged(self, tag):
+		cursor = self.conn.cursor()
+		cursor.execute('SELECT tasks.id, tasks.uuid, tasks.title, \
+tasks.parent_uuid, tasks.progress, tasks.priority, tasks.due, tasks.notes \
+INNER JOIN tags ON tasks.uuid = tags.task_uuid WHERE tags.tag = ?', [tag])
+		tasks = [Task(self, *row) for row in cursor.fetchall()]
+		cursor.close()
+
+		return tasks
+
+class TableView(object):
+	def __init__(self, columns, field_getter = None,
+				 empty_msg = 'No items to display.'):
+		self.columns = tuple(columns)
+		self.lengths = dict(zip(columns, [len(c) + 1 for c in columns]))
+		self.empty_msg = empty_msg
+		self.rows = []
+
+		if field_getter is None:
+			self.field_getter = lambda x, f: x[f]
+		else:
+			self.field_getter = field_getter
+	
+	def add_rows(self, rows):
+		for row in rows:
+			for col in self.columns:
+				value = self.field_getter(row, col)
+				
+				if self.len(value) >= self.lengths[col]:
+					self.lengths[col] = self.len(value) + 1
+
+			self.rows.append(row)
+	
+	def order(self, column, desc = False):
+		self.rows.sort(key = lambda x: self.field_getter(x, column),
+					   reverse = desc)
+	
+	def tree(self, parent_id):
+		children = {}
+		rows = []
+
+		for row in self.rows:
+			pid = parent_id(row)
+			children[pid] = children.get(pid, []) + [row]
+
+		def process_row(current):
+			rows.append(current)
+				
+			for child in children.get(current.uuid, []):
+				process_row(child)
+
+		for row in children.get(None, []):
+			process_row(row)
+
+		self.rows = rows
+
+
+	
+	def header(self, output = sys.stdout.write):
+		output('~B')
+
+		for col in self.columns:
+			output(self.pad(col.title(), self.lengths[col]))
+
+		output('~0\n')
+	
+
+	def pad(self, s, n):
+		if n > self.len(s):
+			s += ' ' * (n - self.len(s))
+
+		return s
+
+	def len(self, s):
+		for l in '0Brgbyz':
+			s = s.replace('~' + l, '')
+		return len(s)
+	
+
+	def format(self, limit = None, output = sys.stdout.write):
+		self.header(output)
+
+		if limit is None:
+			start, end = 0, len(self.rows)
+		else:
+			start, end = limit
+			start = max(start, 0)
+			end = min(end, len(self.rows))
+
+		rows = self.rows[start:end]
+
+		if len(rows) != 0:
+			for row in rows:
+				for col in self.columns:
+					value = self.field_getter(row, col)
+					padded = self.pad(value, self.lengths[col])
+					output(padded)
+				
+				output('\n')
+		else:
+			output(self.empty_msg)
+			output('\n')
 
 
 class TasksApp(object):
@@ -293,96 +498,32 @@ class TasksApp(object):
 
 		sys.stdout.write(out.encode('utf8'))
 	
-	def table(self, sort, descending, number = -1, cond = '1', fields = None):
-		fields = fields or (self.fields + ['n?'])
-		direction = 'DESC' if descending else 'ASC'
+	def table(self, sort, desc, number = -1, cond = '1'):
+		direction = 'DESC' if desc else 'ASC'
 		limit = '' if number == -1 else 'LIMIT %d' % number
-		query = 'WHERE parent_uuid IS NULL AND %s ORDER BY %s %s %s' % (cond,
-			sort.lower(), direction, limit)
+		query = 'WHERE %s ORDER BY %s %s %s' % (cond, sort.lower(),
+												direction, limit)
 		tasks = self.task_list.list(query)
-		
-		if len(tasks) == 0:
-			self.write('There are no tasks to display.\n')
-		else:
-			lengths = {'title': 6, 'progress': 9, 'priority': 9, 'due': 4,
-					   'entered': 8, 'id': 6, 'n?': 3}
-			width = os.environ.get('COLUMNS', 80)
-			maxima =  {'title': width - 40, 'progress': 4, 'priority': 8,
-					   'due': 12, 'entered': 12, 'id': 6, 'n?': 3}
+		view = TableView(self.fields + ['n?'],
+						 lambda x, f: x.format(f))
 
-			# Find the longest for this field
-			def find_longest(tasks, lengths, depth = 0):
-				for field in fields:
-					for task in tasks:
-						length = len(task.format(field)) + 1
-
-						if field == 'id' and depth > 0:
-							length += depth * 2 + 1
-						elif field == 'title':
-							length += depth
-						
-						if length > lengths.get(field, 0) and\
-								length <= maxima[field]:
-							lengths[field] = length
-
-						find_longest(task.children, lengths, depth + 1)
-
-			find_longest(tasks, lengths)
-
-			self.write('~B')
-			for field in fields:
-				spaces = lengths[field] - len(field)
-				self.write(field.title() + ' ' * spaces)
-			self.write('~0\n')
-
-			def do_tasks(tasks, level = 0):
-				for task in tasks:
-					for field in fields:
-						value = task.format(field)
-
-						if field == 'id':
-							value = (u'↳ ' * level) + value
-						elif field == 'title':
-							value = (' ' * level) + value
-
-						if len(value) > lengths[field]:
-							value = value[:lengths[field] - 4] + '... '
-						else:
-							value += ' ' * (lengths[field] - len(value))
-
-						if task.progress == 100:
-							value = '~z%s~0' % value
-						elif field == 'n?' and value.startswith('Y'):
-							value = '~B~gY~0'
-						elif field == 'priority':
-							priority = PRIORITIES[pick(task.priority, 3)]
-							value = PRIORITY_CLR[priority] + value + '~0'
-						elif field == 'progress':
-							progress = pick(task.progress, 79)
-							if progress < 20:
-								colour = '~r'
-							elif progress < 50:
-								colour = '~y'
-							elif progress < 80:
-								colour = ''
-							else:
-								colour = '~g'
-
-							value = colour + value + '~0'
-
-						self.write(value)
-
-					self.write('\n')
-					do_tasks(task.children, level + 1)
-
-			do_tasks(tasks)
+		view.add_rows(tasks)
+		if sort == 'id':
+			view.tree(lambda x: x.parent_uuid)
+		view.format(output = self.write)
 
 	
 	def cmd_list(self, sort = 'id', direction = 'asc', number = -1):
 		self.table(sort, direction == 'desc', number)
 	
 	def cmd_late(self, sort = 'id', direction = 'desc', number = -1):
-		self.table(sort, direction, number, "due < DATETIME('now')")
+		self.table(sort, direction, number, "DATE(due) < DATE('now')")
+
+	def cmd_tagged(self, tag, sort = 'id', direction = 'desc', number = -1):
+		self.table(sort, direction, number, "DATE(due) < DATE('now')")
+
+	def cmd_today(self, sort = 'id', direction = 'desc', number = -1):
+		self.table(sort, direction, number, "DATE(due) = DATE('now')")
 	
 	def get_task(self, id = None, uuid = None, title = None,
 				 parent = None, progress = None, priority = None,
@@ -391,20 +532,7 @@ class TasksApp(object):
 			priority = PRIORITIES.index(priority)
 
 		if due is not None:
-			today = datetime.datetime.now()
-			weekdays = {'monday': MO, 'tuesday': TU, 'wednesday': WE,
-					    'thursday': TH, 'friday': FR}
-
-			if due == 'today':
-				due = today
-			elif due == 'tomorrow':
-				due = today + relativedelta(days = +1)
-			elif due in weekdays:
-				due = today + relativedelta(weekday = weekdays[due])
-			elif due.startswith('next-') and due[5:] in weekdays:
-				due = today + relativedelta(weekday = weekdays[due](2))
-			else:
-				due = dateutil.parser.parse(due, dayfirst = True)
+			due = parse_date(due)
 
 		if parent is not None:
 			# convert from numeric ID -> UUID
@@ -479,7 +607,7 @@ class TasksApp(object):
 		self.write('~BLast Synced:~0 %s\n' % last_sync)
 	
 	def cmd_view(self, id):
-		fields = self.fields + ['notes']
+		fields = self.fields + ['tags', 'notes']
 		max_length = max(map(len, fields))
 		task = self.task_list.find(id)
 
@@ -494,7 +622,9 @@ class TasksApp(object):
 
 		# this will print subtasks as well
 		self.write('\n')
-		self.table('id', True, cond = ('id = %d' % id))
+		if len(task.children) > 0:
+			self.table('id', True, cond="id = %d OR \
+parent_uuid = '%s'" % (id, task.uuid))
 	
 	def cmd_notes(self, id):
 		task = self.task_list.find(id)
@@ -524,6 +654,74 @@ class TasksApp(object):
 	def cmd_deleted(self):
 		[self.write('%s\n' % x) for x in self.task_list.deleted()]
 	
+	def cmd_regen(self):
+		MergeTool.regen()
+	
+	def cmd_motd(self):
+		tasks = len(self.task_list.list())
+		late = len(self.task_list.list("WHERE due < date('now')"))
+		today = len(self.task_list.list("WHERE date(due) = date('now')"))
+		self.write('You have ~B%d~0 tasks, ~B%d~0 for today and \
+~B~r%d~0 late.\n' % (tasks, today, late))
+	
+	def cmd_calendar(self, upto = None):
+		if upto is not None:
+			upto = parse_date(upto)
+
+		dates = {}
+		tasks = self.task_list.list()
+
+		for task in tasks:
+			if task.due is not None and (upto is None or task.due <= upto):
+				date_str = task.due.strftime('%F')
+				dates[date_str] = dates.get(date_str, []) + [task]
+
+		dates = dates.items()
+		dates.sort(key = lambda d: d[0])
+
+		for date, tasks in dates:
+			tasks.sort(key = lambda t: pick(t.priority, 9999))
+			user_date = dateutil.parser.parse(date).strftime('%A, %B %d')
+			self.write('~B%s~0\n' % user_date)
+
+			for task in tasks:
+				if task.priority is not None:
+					self.write(PRIORITY_CLR[PRIORITIES[task.priority]])
+				self.write('    %3d: %s~0\n' % (task.record_id, task.title))
+
+			self.write('\n')
+	
+	def cmd_tag(self, id, *tags):
+		task = self.task_list.find(id)
+
+		for tag in tags:
+			task.tag(tag.decode('utf8'))
+	
+	def cmd_untag(self, id, tag):
+		task = self.task_list.find(id)
+
+		if tag == '*':
+			for tag in task.tags:
+				task.untag(tag.decode('utf8'))
+		else:
+			task.untag(tag)
+	
+	def cmd_switch(self, name):
+		default = os.path.expanduser('~/.taskdb')
+		target = os.path.expanduser('~/.taskdb.d/%s' % name)
+
+		os.unlink(default)
+		os.symlink(default, target)
+		TaskList(target)				# force creation of new DB
+	
+	def cmd_update_tree(self):
+		target = os.path.expanduser('~/.taskdb.d')
+		source = os.path.expanduser('~/.taskdb')
+
+		os.makedirs(target)
+		shutil.move(source, os.path.join(target, 'default'))
+		os.symlink(os.path.join(target, 'default'), source)
+	
 	def cmd_help(self):
 		print('''Usage: %s COMMAND
 
@@ -532,17 +730,21 @@ COMMAND is one of:
 		Add a new task.
 	add-remote   (name, host, [port, user, keyfile])
 		Add a remote host for synchronisation.
+	calendar     ([upto])
+		View your tasks in calendar form by due date, up to a given day.
 	del          (id)
 		Delete a task.
 	deleted
 		[debug] View the list of deleted tasks.
 	help
 		Show this help message.
-	late         (sort, direction, number)
+	late         ([sort, direction, number])
 		Print a listing of late tasks.
-	list         (sort, direction, number)
+	list         ([sort, direction, number])
 		List number (default all) tasks, sorted by the given
 		field (asc or desc).
+	motd
+		Print a message suitable for a .profile or similar.
 	notes        (id)
 		Edit the notes field for the given task using $EDITOR.
 	priorities
@@ -551,12 +753,26 @@ COMMAND is one of:
 		Download a remote tasklist and merge it with the local list.
 	push         (remote)
 		Merge the local tasklist with a remote list and upload it.
+	regen
+		Regenerate a clean task database.
 	remotes
 		List the names of available synchronisation destinations.
 	show-remote  (remote)
 		Show the details associated with a remote destination.
 	set          (id, [title, parent, progress, priority, due, notes])
 		Set the value of a particular field on a task.
+	switch       (name)
+		Switch to a (possibly new) task list called name.
+	tag          (id, tag, [...])
+		Give a task some tags.
+	tagged       (tag)
+		List all the tasks with the given tag.
+	today        ([sort, direction, number])
+		List tasks due for today.
+	update-tree
+		Move from the traditional ~/.taskdb to the new ~/.taskdb.d structure.
+	untag        (id, tag)
+		Remove a tag from a task. The special tag * removes all tags.
 	uuid         (id)
 		[debug] Show the UUID for a given task.
 	uuidgen
@@ -575,27 +791,44 @@ class MergeTool(object):
 		self.src_fn = src
 	
 	def merge(self):
-		self.updates()
-		self.deletes()
+		added, updated = self.updates()
+		deleted = self.deletes()
+
+		return added, updated, deleted
 	
 	def updates(self):
 		# we need to go through all the entries in src and add or amend the
 		# tasks in dest
+		added = 0
+		updated = 0
+
 		for src_task in self.src.list():
 			dest_task = self.dest.find_uuid(src_task.uuid)
 
 			if dest_task is None:
 				self.dest.add(src_task)
+				added += 1
 			else:
 				self.dest.update_uuid(src_task)
+				updated += 1
+
+			for tag in src_task.tags:
+				self.dest.tag(dest_task.uuid, tag)
+
+		return (added, updated)
 	
 	def deletes(self):
 		# now delete any matches we find in the deleted table
+		deleted = 0
+
 		for src_task in self.src.deleted():
 			dest_task = self.dest.find_uuid(src_task)
 
 			if dest_task is not None:
+				deleted += 1
 				dest_task.remove()
+
+		return deleted
 	
 
 	@classmethod
@@ -632,53 +865,84 @@ class MergeTool(object):
 		return transport, sftp
 
 	@classmethod
-	def retrieve_db(cls, host, port = 22, user = None, key = None):
+	def retrieve_db(cls, host, port = 22, user = None, key = None, name = None):
 		transport, sftp = cls.connect(host, port, user, key)
 		target = '/tmp/taskpull.%d' % random.randrange(1, 2 ** 16)
 
 		print('Downloading remote tasklist...')
 		# we should be in the user's home directory
-		sftp.get('.taskdb', target)
+		sftp.get('.taskdb' if name is None else '.taskdb.d/%s' % name, target)
 
 		# deliberately not closing transport
 		return transport, sftp, target
 
 
 	@classmethod
-	def pull(cls, host, port = 22, user = None, key = None):
+	def pull(cls, host, port = 22, user = None, key = None, name = 'default'):
 		# retrieve remote tasklist
-		transport, sftp, target = cls.retrieve_db(host, port, user, key)
+		transport, sftp, target = cls.retrieve_db(host, port, user, key, name)
 		transport.close()
 
 		print('Merging...')
 		source = os.path.expanduser('~/.taskdb')
 		merger = cls(source, target)
-		merger.merge()
+		stats = merger.merge()
 
+		print('%d additions, %d amendments, %d deletions.' % stats)
 		print('Done.')
 		os.unlink(target)
 	
 	@classmethod
-	def push(cls, host, port = 22, user = None, key = None):
+	def push(cls, host, port = 22, user = None, key = None, name = 'default'):
 		# get remote tasklist
 		transport, sftp, target = cls.retrieve_db(host, port, user, key)
 		source = os.path.expanduser('~/.taskdb')
 
 		print('Merging...')
 		merger = cls(target, source)
-		merger.merge()
+		stats = merger.merge()
 
 		print('Uploading tasklist...')
-		sftp.put(target, '.taskdb')
+		sftp.put(target, '.taskdb.d/%s' % name)
 		transport.close()
 
+		print('%d additions, %d amendments, %d deletions.' % stats)
 		print('Done.')
 		os.unlink(target)
+	
+	@classmethod
+	def regen(cls):
+		'Recreate the task database with the latest schema.'
+		print('Creating new database...')
+		source = os.path.realpath(os.path.expanduser('~/.taskdb'))
+		target = '/tmp/taskgen.%d' % random.randrange(1, 2 ** 16)
+		merger = cls(target, source)
+
+		print('Merging...')
+		merger.merge()
+
+		print('Copying remotes...')
+		for name in merger.src.remotes():
+			host, port, user, key, last_sync = merger.src.remote(name)
+			merger.dest.add_remote(name, host, port, user, key)
+			merger.dest.remote_synced(name, last_sync)
+
+		print('Replacing files...')
+		shutil.copy(source, '/tmp/taskbak.%d' % time.time())
+		shutil.move(target, source)
+
+		print('Done.')
+
 
 
 if __name__ == '__main__':
-	task_list = TaskList(os.path.expanduser('~/.taskdb'))
-	sys.stdout.write('\r          \r')
+	for i, arg in enumerate(sys.argv):
+		if arg[0] == ':':
+			TaskList.name_override = arg[1:]
+			sys.argv.remove(i)
+			break
+
+	task_list = TaskList(TaskList.active_path())
 	TasksApp(task_list).run()
 
 	
