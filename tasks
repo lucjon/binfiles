@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf8
-import datetime, dateutil.parser, getpass, os, random, sqlite3
+import datetime, dateutil.parser, getpass, os, paramiko, random, sqlite3
 import shutil, sys, time
 from dateutil.relativedelta import *
 from uuid import uuid4
@@ -101,7 +101,7 @@ class Task(object):
 		self.task_list.tag(self.uuid, tag)
 
 	
-	def format_str(self, field):
+	def format_str(self, field, with_depth = True):
 		if hasattr(self, field) and getattr(self, field) is None:
 			return '-'
 		elif field == 'progress':
@@ -113,13 +113,16 @@ class Task(object):
 		elif field == 'entered':
 			return self.entered.strftime('%d/%m/%y')
 		elif field == 'id':
-			if self.depth > 0:
+			if self.depth > 0 and with_depth:
 				spaces = ('  ' * max(0, self.depth - 1))
 				return spaces + u'↳ ' + str(self.record_id)
 			else:
 				return str(self.record_id)
 		elif field == 'title':
-			return (' ' * self.depth) + self.title
+			if with_depth:
+				return (' ' * self.depth) + self.title
+			else:
+				return self.title
 		elif field == 'n?':
 			return 'N' if self.notes is None else 'Y'
 		elif field == 'notes':
@@ -129,7 +132,7 @@ class Task(object):
 		else:
 			return str(getattr(self, field))
 	
-	def format(self, field):
+	def format(self, field, with_depth = True):
 		if self.progress == 100:
 			return '~z%s~0' % self.format_str(field)
 		elif field == 'n?':
@@ -150,7 +153,7 @@ class Task(object):
 
 			return colour + self.format_str(field) + '~0'
 		else:
-			return self.format_str(field)
+			return self.format_str(field, with_depth)
 	
 	def to_list(self):
 		return [self.uuid, self.title, self.parent_uuid, self.progress,
@@ -461,13 +464,18 @@ class TasksApp(object):
 		funct = 'cmd_' + command.replace('-', '_')
 
 		def parse(arg):
-			try:
-				return int(arg)
-			except ValueError:
+			if arg == 'yes':
+				return True
+			elif arg == 'no':
+				return False
+			else:
 				try:
-					return float(arg)
+					return int(arg)
 				except ValueError:
-					return arg
+					try:
+						return float(arg)
+					except ValueError:
+						return arg
 
 		if hasattr(self, funct):
 			pos = []
@@ -503,7 +511,7 @@ class TasksApp(object):
 												direction, limit)
 		tasks = self.task_list.list(query)
 		view = TableView(self.fields + ['n?'],
-						 lambda x, f: x.format(f))
+						 lambda x, f: x.format(f, sort == 'id'))
 
 		view.add_rows(tasks)
 		if sort == 'id':
@@ -522,6 +530,10 @@ class TasksApp(object):
 
 	def cmd_today(self, sort = 'id', direction = 'desc', number = -1):
 		self.table(sort, direction, number, "DATE(due) = DATE('now')")
+
+	def cmd_tomorrow(self, sort = 'id', direction = 'desc', number = -1):
+		tdate = (datetime.date.today() + relativedelta(days=1)).strftime('%F')
+		self.table(sort, direction, number, "DATE(due) <= '%s'" % tdate)
 	
 	def get_task(self, id = None, uuid = None, title = None,
 				 parent = None, progress = None, priority = None,
@@ -655,10 +667,12 @@ parent_uuid = '%s'" % (id, task.uuid))
 	def cmd_regen(self):
 		MergeTool.regen()
 	
-	def cmd_motd(self, style = 'default', reset = '~0'):
+	def cmd_motd(self, style = 'default', reset = '~0', sep = '\n'):
 		tasks = len(self.task_list.list())
-		late = len(self.task_list.list("WHERE due < date('now')"))
-		today = len(self.task_list.list("WHERE date(due) = date('now')"))
+		late = len(self.task_list.list("WHERE due < date('now') AND \
+progress != 100"))
+		today = len(self.task_list.list("WHERE date(due) = date('now') \
+AND progress != 100"))
 
 		if style == 'default':
 			self.write('You have ~B%d~0 tasks, ~B%d~0 for today and \
@@ -667,7 +681,7 @@ parent_uuid = '%s'" % (id, task.uuid))
 			self.write('~B%d%s ~B%d%s ~B~r%d%s' % (tasks, reset, today, reset,
 					   late, reset))
 		elif style == 'raw':
-			self.write('%d\n%d\n%d\n' % (tasks, today, late))
+			self.write('%d%s%d%s%d%s' % (tasks, sep, today, sep, late, sep))
 	
 	def cmd_calendar(self, upto = None):
 		if upto is not None:
@@ -791,6 +805,8 @@ COMMAND is one of:
 		List all the tasks with the given tag.
 	today        ([sort, direction, number])
 		List tasks due for today.
+	tomorrow
+		List tasks due on or before tomorrow.
 	update-tree
 		Move from the traditional ~/.taskdb to the new ~/.taskdb.d structure.
 	untag        (id, tag)
@@ -808,7 +824,6 @@ class MergeTool(object):
 	'Merges one task database into another.'
 	def __init__(self, dest, src):
 		# so we don't bog down loading when we don't need SSH
-		import paramiko
 		self.dest = TaskList(dest)
 		self.dest_fn = dest
 		self.src = TaskList(src)
